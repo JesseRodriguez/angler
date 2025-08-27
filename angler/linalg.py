@@ -2,11 +2,50 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spl
 
+# ----------------------------------------------------------------------
+# Portable, high-performance solver selection
+#  - x86_64 (Intel/AMD): try PARDISO (pypardiso or legacy pyMKL)
+#  - Apple Silicon / other arch: use SciPy; prefer UMFPACK if available
+#  - Allow manual override via env var: ANGLER_SOLVER={pardiso,scipy}
+# ----------------------------------------------------------------------
+import os
+import platform
+
+_ARCH = platform.machine().lower()
+_IS_X86_64 = _ARCH in ("x86_64", "amd64")
+_ENV_SOLVER = os.getenv("ANGLER_SOLVER", "").lower()
+
+HAVE_PYPARDISO = False
+HAVE_PYMKL = False
+HAVE_UMFPACK = False
+
+if _IS_X86_64:
+    try:
+        # Preferred modern wrapper; bundles MKL RT on common platforms
+        from pypardiso import spsolve as _pardiso_spsolve
+        HAVE_PYPARDISO = True
+    except Exception:
+        pass
+    try:
+        # Legacy interface used by older code
+        from pyMKL import pardisoSolver as _pyMKL_pardisoSolver
+        HAVE_PYMKL = True
+    except Exception:
+        pass
+
 try:
-    from pyMKL import pardisoSolver
-    SOLVER = 'pardiso'
-except:
-    SOLVER = 'scipy'
+    # If installed, SciPy can route to UMFPACK for speed on CSC matrices
+    import scikits.umfpack as _umf
+    HAVE_UMFPACK = True
+except Exception:
+    HAVE_UMFPACK = False
+
+# Default solver policy (can be overridden by angler.constants.DEFAULT_SOLVER)
+if _ENV_SOLVER in ("pardiso", "pypardiso"):
+    SOLVER = "pardiso" if _IS_X86_64 and (HAVE_PYPARDISO or HAVE_PYMKL) \
+        else "scipy"
+else:
+    SOLVER = "scipy"
 
 from time import time
 
@@ -121,67 +160,118 @@ def solver_eigs(A, Neigs, guess_value=0, guess_vector=None, timing=False):
 
 
 def solver_direct(A, b, timing=False, solver=SOLVER):
-    # solves linear system of equations
+    """
+    Solve A x = b. Fast path prefers PARDISO on x86_64. Otherwise uses
+    SciPy, ensuring CSC format and leveraging UMFPACK if available.
 
-    b = b.astype(np.complex128)
-    b = b.reshape((-1,))
+    Args:
+        A: sparse matrix (prefer CSR/CSC), complex OK.
+        b: rhs vector/array (complex supported).
+        timing: print solve time.
+        solver: 'pardiso' or 'scipy'. Auto-selected at import, but can
+                be overridden per-call.
 
+    Returns:
+        x: solution vector (np.ndarray).
+    """
+    b = b.astype(np.complex128).reshape((-1,))
     if not b.any():
-        return np.zeros(b.shape)
+        return np.zeros(b.shape, dtype=np.complex128)
 
     if timing:
         t = time()
 
-    if solver.lower() == 'pardiso':
-        pSolve = pardisoSolver(A, mtype=13) # Matrix is complex unsymmetric due to SC-PML
-        pSolve.factor()
-        x = pSolve.solve(b)
-        pSolve.clear()
+    # Convert to CSC for best performance in both UMFPACK and SuperLU
+    A_csc = A if sp.isspmatrix_csc(A) else A.tocsc()
 
-    elif solver.lower() == 'scipy':
-        x = spl.spsolve(A, b)
-
+    if solver.lower() == "pardiso":
+        if HAVE_PYPARDISO:
+            # pypardiso has a simple spsolve-style API
+            x = _pardiso_spsolve(A_csc, b)
+        elif HAVE_PYMKL:
+            # Legacy pyMKL path with explicit factor/solve/clear
+            # 13 = complex, unsymmetric (SC-PML makes it non-Hermitian)
+            ps = _pyMKL_pardisoSolver(A_csc, mtype=13)
+            ps.factor()
+            x = ps.solve(b)
+            ps.clear()
+        else:
+            # If user forced 'pardiso' but none is present, fall back
+            x = spl.spsolve(A_csc, b)
+    elif solver.lower() == "scipy":
+        # Try to request UMFPACK when available (SciPy may accept kw)
+        try:
+            x = spl.spsolve(A_csc, b, use_umfpack=HAVE_UMFPACK)
+        except TypeError:
+            # SciPy without 'use_umfpack' arg
+            x = spl.spsolve(A_csc, b)
     else:
-        raise ValueError('Invalid solver choice: {}, options are pardiso or scipy'.format(str(solver)))
+        raise ValueError(
+            "Invalid solver choice: {} (use 'pardiso' or 'scipy')"
+            .format(str(solver))
+        )
 
     if timing:
-        print('Linear system solve took {:.2f} seconds'.format(time()-t))
+        print("Linear system solve took {:.2f} seconds".format(time() - t))
 
     return x
 
 
 def solver_complex2real(A11, A12, b, timing=False, solver=SOLVER):
-    # solves linear system of equations [A11, A12; A21*, A22*]*[x; x*] = [b; b*]
+    """
+    Solve the real-embedded system:
+      [A11, A12; A21*, A22*] [x; x*] = [b; b*]
+    built as a 2N x 2N real system.
 
-    b = b.astype(np.complex128)
-    b = b.reshape((-1,))
+    Notes:
+        - Real unsymmetric system (PARDISO mtype=11).
+        - We assemble CSC and apply same solver policy as solver_direct.
+    """
+    b = b.astype(np.complex128).reshape((-1,))
     N = b.size
-
     if not b.any():
-        return np.zeros(b.shape)
+        return np.zeros(b.shape, dtype=np.complex128)
 
     b_re = np.real(b).astype(np.float64)
     b_im = np.imag(b).astype(np.float64)
 
-    Areal = sp.vstack((sp.hstack((np.real(A11) + np.real(A12), - np.imag(A11) + np.imag(A12))),
-                       sp.hstack((np.imag(A11) + np.imag(A12), np.real(A11) - np.real(A12)))))
+    # Build the 2N x 2N real system in block form
+    Areal = sp.vstack((
+        sp.hstack((np.real(A11) + np.real(A12),
+                   -np.imag(A11) + np.imag(A12))),
+        sp.hstack((np.imag(A11) + np.imag(A12),
+                   np.real(A11) - np.real(A12)))
+    ))
+    A_csc = Areal if sp.isspmatrix_csc(Areal) else Areal.tocsc()
+    rhs = np.hstack((b_re, b_im))
 
     if timing:
         t = time()
 
-    if solver.lower() == 'pardiso':
-        pSolve = pardisoSolver(Areal, mtype=11)  # Matrix is real unsymmetric
-        pSolve.factor()
-        x = pSolve.solve(np.hstack((b_re, b_im)))
-        pSolve.clear()
-
-    elif solver.lower() == 'scipy':
-        x = spsolve(Areal, np.hstack((b_re, b_im)))
-
+    if solver.lower() == "pardiso":
+        if HAVE_PYPARDISO:
+            x = _pardiso_spsolve(A_csc, rhs)
+        elif HAVE_PYMKL:
+            # 11 = real unsymmetric
+            ps = _pyMKL_pardisoSolver(A_csc, mtype=11)
+            ps.factor()
+            x = ps.solve(rhs)
+            ps.clear()
+        else:
+            x = spl.spsolve(A_csc, rhs)
+    elif solver.lower() == "scipy":
+        try:
+            x = spl.spsolve(A_csc, rhs, use_umfpack=HAVE_UMFPACK)
+        except TypeError:
+            x = spl.spsolve(A_csc, rhs)
     else:
-        raise ValueError('Invalid solver choice: {}, options are pardiso or scipy'.format(str(solver)))
+        raise ValueError(
+            "Invalid solver choice: {} (use 'pardiso' or 'scipy')"
+            .format(str(solver))
+        )
 
     if timing:
-        print('Linear system solve took {:.2f} seconds'.format(time()-t))
+        print("Linear system solve took {:.2f} seconds".format(time() - t))
 
-    return (x[:N] + 1j*x[N:2*N])
+    # Recombine to complex solution
+    return x[:N] + 1j * x[N:2*N]
